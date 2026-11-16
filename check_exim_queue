@@ -1,0 +1,51 @@
+#!/bin/bash
+#
+# check_exim_queue - Nagios plugin to check the number of mails in the
+# exim mail queue. Modeled after check_postfix_queue.
+
+# exit codes
+e_ok=0
+e_warning=1
+e_critical=2
+e_unknown=3
+
+usage="Invalid command line usage"
+
+if [ -z $1 ]; then
+    echo $usage
+    echo "UNKNOWN"
+    exit $e_unknown
+fi
+
+while getopts ":w:c:" options
+do
+    case $options in
+        w ) warning=$OPTARG ;;
+        c ) critical=$OPTARG ;;
+        * ) echo $usage
+	    echo "UNKNOWN"
+            exit $e_unknown ;;
+    esac
+done
+
+# determine queue size
+qsize=$(exim -bpc 2>/dev/null)
+if [ -z "$qsize" ]
+then
+    echo "UNKNOWN"
+    exit $e_unknown
+fi
+
+if [ $qsize -ge $critical ]; then
+    retval=$e_critical
+    echo -n "CRITICAL - "
+elif [ $qsize -ge $warning ]; then
+    retval=$e_warning
+    echo -n "WARNING - "
+elif [ $qsize -lt $warning ]; then
+    retval=$e_ok
+    echo -n "OK - "
+fi
+
+echo "$qsize mail(s) in queue | mail_queue=$qsize"
+exit $retval
