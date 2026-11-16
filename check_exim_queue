@@ -1,51 +1,230 @@
 #!/bin/bash
+# Nagios/Icinga plugin to check the exim mail queue: the number of messages,
+# frozen messages and the age of the oldest message.
 #
-# check_exim_queue - Nagios plugin to check the number of mails in the
-# exim mail queue. Modeled after check_postfix_queue.
+# Copyright (C) 2015-2026 Thomas Wagner <wagner-thomas@gmx.at>
+# SPDX-License-Identifier: GPL-2.0-or-later
 
-# exit codes
-e_ok=0
-e_warning=1
-e_critical=2
-e_unknown=3
+VERSION=0.1
 
-usage="Invalid command line usage"
+export LC_ALL=C
 
-if [ -z $1 ]; then
-    echo $usage
-    echo "UNKNOWN"
-    exit $e_unknown
-fi
+STATE_OK=0
+STATE_WARNING=1
+STATE_CRITICAL=2
+STATE_UNKNOWN=3
 
-while getopts ":w:c:" options
+WARN=""
+CRIT=""
+WARN_FROZEN=""
+CRIT_FROZEN=""
+WARN_AGE=""
+CRIT_AGE=""
+DETAILS=""
+SUDO=""
+EXIM=""
+TIMEOUT=10
+
+usage()
+{
+cat << EOF
+Usage: check_exim_queue [-w COUNT] [-c COUNT] [-f COUNT] [-F COUNT] [-a AGE] [-A AGE] [-x] [-S] [-e EXIM] [-t SECONDS]
+
+Checks the exim mail queue. Without -a, -A, -f, -F and -x it only counts the
+messages (exim -bpc); with them, it reads the queue listing (exim -bp) and
+also reports frozen messages and the age of the oldest message.
+
+-w COUNT    WARNING if this many messages or more are in the queue
+-c COUNT    CRITICAL if this many messages or more are in the queue
+-f COUNT    WARNING if this many frozen messages or more are in the queue
+-F COUNT    CRITICAL if this many frozen messages or more are in the queue
+-a AGE      WARNING if the oldest message is this old or older
+-A AGE      CRITICAL if the oldest message is this old or older
+            AGE is in minutes, or a number with m, h or d (e.g. 30m, 4h, 2d)
+-x          report frozen messages and the oldest message without thresholds
+-S          run exim with sudo -n; only exim admin users may list the queue
+-e EXIM     the exim binary (default: exim, exim4, /usr/sbin/exim or /usr/sbin/exim4)
+-t SECONDS  give up after this many seconds (default 10)
+-V          show the version
+-h          show this help
+EOF
+}
+
+unknown()
+{
+    echo "EXIM QUEUE UNKNOWN - $1"
+    exit $STATE_UNKNOWN
+}
+
+# minutes AGE: AGE in minutes; AGE is a number of minutes or a number with m, h or d
+minutes()
+{
+    case $1 in
+        *m) echo "${1%m}" ;;
+        *h) echo $((${1%h} * 60)) ;;
+        *d) echo $((${1%d} * 1440)) ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# check_count VALUE NAME: VALUE must be a non-negative integer
+check_count()
+{
+    [ -z "$1" ] || [[ $1 =~ ^[0-9]+$ ]] || unknown "$2 must be a number of messages, not '$1'"
+}
+
+# check_age VALUE NAME: VALUE must be minutes or a number with m, h or d
+check_age()
+{
+    [ -z "$1" ] || [[ $1 =~ ^[0-9]+[mhd]?$ ]] || unknown "$2 must be minutes or a number with m, h or d, not '$1'"
+}
+
+# check_order WARN CRIT NAMES: the warning threshold must not be above the critical one
+check_order()
+{
+    [ -z "$1" ] || [ -z "$2" ] || [ "$1" -le "$2" ] || unknown "the warning threshold of $3 is above the critical one"
+}
+
+# state VALUE WARN CRIT: the state of VALUE, which alerts when it reaches a threshold
+state()
+{
+    if [ -n "$3" ] && [ "$1" -ge "$3" ]; then
+        echo $STATE_CRITICAL
+    elif [ -n "$2" ] && [ "$1" -ge "$2" ]; then
+        echo $STATE_WARNING
+    else
+        echo $STATE_OK
+    fi
+}
+
+# human MINUTES: an age like exim -bp shows it
+human()
+{
+    if [ "$1" -lt 120 ]; then
+        echo "${1}m"
+    elif [ "$1" -lt 4320 ]; then
+        echo "$(($1 / 60))h"
+    else
+        echo "$(($1 / 1440))d"
+    fi
+}
+
+while getopts ":hVw:c:f:F:a:A:xSe:t:" OPTION
 do
-    case $options in
-        w ) warning=$OPTARG ;;
-        c ) critical=$OPTARG ;;
-        * ) echo $usage
-	    echo "UNKNOWN"
-            exit $e_unknown ;;
+    case $OPTION in
+        h) usage
+           exit $STATE_UNKNOWN
+           ;;
+        V) echo "check_exim_queue $VERSION"
+           exit $STATE_UNKNOWN
+           ;;
+        w) WARN=$OPTARG ;;
+        c) CRIT=$OPTARG ;;
+        f) WARN_FROZEN=$OPTARG; DETAILS=1 ;;
+        F) CRIT_FROZEN=$OPTARG; DETAILS=1 ;;
+        a) WARN_AGE=$OPTARG; DETAILS=1 ;;
+        A) CRIT_AGE=$OPTARG; DETAILS=1 ;;
+        x) DETAILS=1 ;;
+        S) SUDO=1 ;;
+        e) EXIM=$OPTARG ;;
+        t) TIMEOUT=$OPTARG ;;
+        :) unknown "option -$OPTARG needs an argument" ;;
+        ?) unknown "unknown option -$OPTARG" ;;
     esac
 done
+shift $((OPTIND - 1))
+[ $# -eq 0 ] || unknown "unexpected argument $1"
+check_count "$WARN" -w
+check_count "$CRIT" -c
+check_count "$WARN_FROZEN" -f
+check_count "$CRIT_FROZEN" -F
+check_age "$WARN_AGE" -a
+check_age "$CRIT_AGE" -A
+[[ $TIMEOUT =~ ^[1-9][0-9]*$ ]] || unknown "the timeout must be a positive number of seconds, not '$TIMEOUT'"
+[ -z "$WARN_AGE" ] || WARN_AGE=$(minutes "$WARN_AGE")
+[ -z "$CRIT_AGE" ] || CRIT_AGE=$(minutes "$CRIT_AGE")
+check_order "$WARN" "$CRIT" "the queue (-w, -c)"
+check_order "$WARN_FROZEN" "$CRIT_FROZEN" "frozen messages (-f, -F)"
+check_order "$WARN_AGE" "$CRIT_AGE" "the age (-a, -A)"
 
-# determine queue size
-qsize=$(exim -bpc 2>/dev/null)
-if [ -z "$qsize" ]
-then
-    echo "UNKNOWN"
-    exit $e_unknown
+if [ -z "$EXIM" ]; then
+    for candidate in exim exim4 /usr/sbin/exim /usr/sbin/exim4; do
+        if command -v "$candidate" > /dev/null; then
+            EXIM=$(command -v "$candidate")
+            break
+        fi
+    done
+    [ -n "$EXIM" ] || unknown "exim not found; give its path with -e"
+elif ! [ -x "$EXIM" ]; then
+    unknown "$EXIM is not executable"
+fi
+command -v timeout > /dev/null || unknown "timeout not found, install coreutils"
+
+COMMAND=(timeout "$TIMEOUT")
+if [ -n "$SUDO" ]; then
+    command -v sudo > /dev/null || unknown "sudo not found, but -S is given"
+    COMMAND+=(sudo -n)
+fi
+COMMAND+=("$EXIM")
+if [ -n "$DETAILS" ]; then
+    COMMAND+=(-bp)
+else
+    COMMAND+=(-bpc)
 fi
 
-if [ $qsize -ge $critical ]; then
-    retval=$e_critical
-    echo -n "CRITICAL - "
-elif [ $qsize -ge $warning ]; then
-    retval=$e_warning
-    echo -n "WARNING - "
-elif [ $qsize -lt $warning ]; then
-    retval=$e_ok
-    echo -n "OK - "
+ERRORS=$(mktemp) || unknown "cannot create a temporary file"
+trap 'rm -f "$ERRORS"' EXIT
+OUTPUT=$("${COMMAND[@]}" 2> "$ERRORS")
+RC=$?
+
+if [ $RC -eq 124 ]; then
+    unknown "$EXIM did not list the queue within ${TIMEOUT}s"
+fi
+if [ $RC -ne 0 ]; then
+    ERROR=$(grep -m 1 . "$ERRORS")
+    [ -n "$ERROR" ] || ERROR=$(grep -m 1 . <<< "$OUTPUT")
+    HINT=""
+    if [[ ${ERROR,,} == *"permission denied"* ]] && [ -z "$SUDO" ]; then
+        HINT=" (only exim admin users may list the queue: use -S with a sudo rule, or add the user to an admin group of exim)"
+    fi
+    unknown "$EXIM failed with status $RC: ${ERROR:-no message}$HINT"
 fi
 
-echo "$qsize mail(s) in queue | mail_queue=$qsize"
-exit $retval
+if [ -z "$DETAILS" ]; then
+    COUNT=$(grep -m 1 . <<< "$OUTPUT")
+    [[ $COUNT =~ ^[0-9]+$ ]] || unknown "$EXIM -bpc printed '$COUNT' instead of a number"
+else
+    # the first line of each message: age (Nm, Nh or Nd), size, id, sender, and *** frozen ***
+    read -r COUNT FROZEN OLDEST < <(awk '
+        /^ *[0-9]+[mhd] / {
+            age = $1 + 0
+            if ($1 ~ /h$/) age *= 60
+            else if ($1 ~ /d$/) age *= 1440
+            count++
+            if (age > oldest) oldest = age
+            if (/\*\*\* frozen \*\*\*$/) frozen++
+        }
+        END { printf "%d %d %d\n", count, frozen, oldest }' <<< "$OUTPUT")
+fi
+
+STATE=$(state "$COUNT" "$WARN" "$CRIT")
+TEXT="$COUNT message(s) in the queue"
+PERFDATA="queue=$COUNT;$WARN;$CRIT;0"
+if [ -n "$DETAILS" ]; then
+    FROZEN_STATE=$(state "$FROZEN" "$WARN_FROZEN" "$CRIT_FROZEN")
+    AGE_STATE=$(state "$OLDEST" "$WARN_AGE" "$CRIT_AGE")
+    [ "$FROZEN_STATE" -le "$STATE" ] || STATE=$FROZEN_STATE
+    [ "$AGE_STATE" -le "$STATE" ] || STATE=$AGE_STATE
+    TEXT+=", $FROZEN frozen"
+    [ "$COUNT" -eq 0 ] || TEXT+=", the oldest $(human "$OLDEST") old"
+    PERFDATA+=" frozen=$FROZEN;$WARN_FROZEN;$CRIT_FROZEN;0"
+    PERFDATA+=" oldest=$((OLDEST * 60))s;${WARN_AGE:+$((WARN_AGE * 60))};${CRIT_AGE:+$((CRIT_AGE * 60))};0"
+fi
+
+case $STATE in
+    "$STATE_OK") LABEL=OK ;;
+    "$STATE_WARNING") LABEL=WARNING ;;
+    *) LABEL=CRITICAL ;;
+esac
+echo "EXIM QUEUE $LABEL - $TEXT|$PERFDATA"
+exit "$STATE"

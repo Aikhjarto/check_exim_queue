@@ -1,0 +1,21 @@
+# bash completion for check_exim_queue                       -*- shell-script -*-
+
+_check_exim_queue()
+{
+    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
+    COMPREPLY=()
+
+    case $prev in
+        -e)
+            mapfile -t COMPREPLY < <(compgen -f -- "$cur")
+            return
+            ;;
+        -w | -c | -f | -F | -a | -A | -t)
+            return
+            ;;
+    esac
+
+    # no positional arguments: offer the options
+    mapfile -t COMPREPLY < <(compgen -W '-w -c -f -F -a -A -x -S -e -t -V -h' -- "$cur")
+}
+complete -F _check_exim_queue check_exim_queue
